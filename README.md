@@ -13,20 +13,19 @@ Identify SA2 regions in Australia where population growth indicators exceed serv
 - Railway stations
 - Road infrastructure
 - ABS SA2 data
+- Google Places API
 
 ## Method
 Demand signals:
-- construction permits
+- Construction permits
 - Crime data
 
 Supply signals:
-- healthcare locations
-- education locations
-- petrol stations
 
 Infrastructure:
-- railway access
-- road access
+- Railway stations
+- Road density
+- Petrol stations
 
 ## Output
 Opportunity score for each SA2 region.
