@@ -30,7 +30,7 @@ def meters_to_lng_deg(meters, lat):
     return meters / (111320 * math.cos(math.radians(lat)))
 
 
-def generate_search_points_in_polygon(geojson_geometry, step_meters=100):
+def generate_search_points_in_polygon(geojson_geometry, step_meters=150):
 
     polygon = shape(geojson_geometry)
 
@@ -70,7 +70,7 @@ def nearby_search(lat, lng, radius, keyword):
 
     params = {
         "location": f"{lat},{lng}",
-        "radius": radius,
+        "radius": int(radius),
         "keyword": keyword,
         "key": API_KEY
     }
@@ -81,8 +81,16 @@ def nearby_search(lat, lng, radius, keyword):
 
         r = requests.get(url, params=params).json()
 
-        print("Nearby status:", r.get("status"),
-              "results:", len(r.get("results", [])))
+        status = r.get("status")
+
+        if status == "OVER_QUERY_LIMIT":
+            print("Rate limit hit — waiting 10 seconds")
+            time.sleep(10)
+            continue  # retry the point
+
+        if status not in ("OK", "ZERO_RESULTS"):
+            print(f"API warning at ({lat},{lng}): {status} — {r.get('error_message', '')}")
+            break
 
         if "results" in r:
             results.extend(r["results"])
@@ -102,30 +110,16 @@ def nearby_search(lat, lng, radius, keyword):
     return results
 
 
-def get_details(place_id):
-
-    url = "https://maps.googleapis.com/maps/api/place/details/json"
-
-    params = {
-        "place_id": place_id,
-        "fields": "name,rating,user_ratings_total,formatted_phone_number,formatted_address,geometry,business_status,types",
-        "key": API_KEY
-    }
-
-    r = requests.get(url, params=params).json()
-
-    return r.get("result", {})
-
-
 # ==============================
 # MAIN SCAN FUNCTION
 # ==============================
 
 def scan_businesses_in_sa2(
         sa2_geometry,
-        step_meters=100,
+        step_meters=150,
         radius=100,
-        keyword="Restaurant"
+        keyword="Restaurant",
+        max_points=200
 ):
 
     polygon = shape(sa2_geometry)
@@ -138,11 +132,18 @@ def scan_businesses_in_sa2(
         step_meters
     )
 
-    print(f"Generated {len(search_points)} search points inside SA2")
+    while len(search_points) > max_points:
+        step_meters = int(step_meters * 1.5)
+        radius = int(step_meters / 1.73)
+        radius = max(100, min(radius, 50000))  # Google max is 50000
+        search_points = generate_search_points_in_polygon(sa2_geometry, step_meters)
 
-    for lat, lng in search_points:
+    print(f"Scanning {len(search_points)} search points...")
 
-        print(f"Searching at {lat},{lng}")
+    for i, (lat, lng) in enumerate(search_points):
+
+        if i % 50 == 0:
+            print(f"  Progress: {i}/{len(search_points)} points, {len(leads)} leads so far")
 
         businesses = nearby_search(lat, lng, radius, keyword)
 
@@ -153,18 +154,18 @@ def scan_businesses_in_sa2(
             if pid in all_place_ids:
                 continue
 
-            all_place_ids.add(pid)
+            # Pre-filter using data already in nearby_search response
+            if b.get("business_status") != "OPERATIONAL":
+                continue
 
-            details = get_details(pid)
+            if b.get("rating", 0) <= 3:
+                continue
 
-            status = details.get("business_status")
-            rating = details.get("rating")
-            reviews = details.get("user_ratings_total")
-            phone = details.get("formatted_phone_number")
+            if b.get("user_ratings_total", 0) <= 10:
+                continue
 
-            biz_geometry = details.get("geometry", {})
-            biz_location = biz_geometry.get("location", {})
-
+            # Check polygon containment using nearby_search geometry
+            biz_location = b.get("geometry", {}).get("location", {})
             biz_lat = biz_location.get("lat")
             biz_lng = biz_location.get("lng")
 
@@ -174,25 +175,17 @@ def scan_businesses_in_sa2(
             if not polygon.contains(Point(biz_lng, biz_lat)):
                 continue
 
-            if (
-                status == "OPERATIONAL"
-                and rating is not None and rating > 3
-                and reviews is not None and reviews > 10
-                and phone
-            ):
+            all_place_ids.add(pid)
 
-                leads.append([
-                    details.get("name", ""),
-                    details.get("formatted_address", ""),
-                    json.dumps(details.get("geometry", {})),
-                    status,
-                    ", ".join(details.get("types", [])),
-                    phone,
-                    rating,
-                    reviews
-                ])
-
-            time.sleep(0.1)
+            leads.append([
+                b.get("name", ""),
+                b.get("vicinity", ""),
+                json.dumps(b.get("geometry", {})),
+                b.get("business_status", ""),
+                ", ".join(b.get("types", [])),
+                b.get("rating"),
+                b.get("user_ratings_total")
+            ])
 
     return leads
 
@@ -213,7 +206,6 @@ def save_csv(leads):
             "Geometry",
             "Business Status",
             "Types",
-            "Phone",
             "Rating",
             "Reviews"
         ])
@@ -234,7 +226,7 @@ if __name__ == "__main__":
 
     leads = scan_businesses_in_sa2(
         sa2_geometry,
-        step_meters=100,
+        step_meters=150,
         radius=100,
         keyword="Restaurant"
     )
