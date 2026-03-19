@@ -1,7 +1,6 @@
 import os
 import pandas as pd
 import snowflake.connector
-import local_business_directory
 import json
 import math
 from shapely.geometry import shape
@@ -12,7 +11,7 @@ from local_business_directory import scan_businesses_in_sa2
 from dotenv import load_dotenv
 from scipy.spatial import KDTree
 
-sa2=input("Gimme Sa2 code pls: ")
+sa2_code=input("Gimme Sa2 code pls: ")
 state="NSW"
 niche=input("What niche are you interested in? ")
 
@@ -28,8 +27,8 @@ conn = snowflake.connector.connect(
     schema=os.getenv("SNOWFLAKE_SCHEMA"),
 )
 
-# Defines the run_query function for creating tables to keep code cleaner when running queries
-def run_query(query):
+# Define Golobal Functions
+def run_query(query): #DataFrame query
     cur = conn.cursor()
     try:
         cur.execute(query)
@@ -37,8 +36,7 @@ def run_query(query):
     finally:
         cur.close()
 
-# Defines the run_query_value function for determining single values in tables
-def run_query_value(query):
+def run_query_value(query): #Datapoint query
     cur = conn.cursor()
     try:
         cur.execute(query)
@@ -46,30 +44,38 @@ def run_query_value(query):
     finally:
         cur.close()
 
-# Main
-
 # Get Number of People
-
-sa2_row = run_query(f"""
+sa2_info = run_query(f"""
                     SELECT sa2_name_2021, area_albers_sqkm, geometry
     FROM geography__boundaries__insights__australia.geography_aus_free.abs_sa2_2021_aust_gda2020
-    WHERE sa2_code_2021 = '{sa2}'
+    WHERE sa2_code_2021 = '{sa2_code}'
                     """)
 
-sa2_name = sa2_row["SA2_NAME_2021"].iloc[0]
-area = float(sa2_row["AREA_ALBERS_SQKM"].iloc[0])
-geometry_string = sa2_row["GEOMETRY"].iloc[0]
+sa2_name = sa2_info["SA2_NAME_2021"].iloc[0]
+area = float(sa2_info["AREA_ALBERS_SQKM"].iloc[0])
+geometry_string = sa2_info["GEOMETRY"].iloc[0]
 
 print("Sa2 Name: ", sa2_name)
 
-value = run_query_value(f"""
-               select obs_value
-               from abs_socioeconomic_indexes_for_areas_seifa_2021_data__free.seifa.seifa_sa2
-where seifa_sa2 = '{sa2}' and unit_of_measure = 'Persons'
-               Order by obs_value desc
-               limit 1               
-               """)
-print("Population of the Sa2: ", value)
+seifa_df = run_query(f"""
+    SELECT index_type, unit_of_measure, obs_value
+    FROM abs_socioeconomic_indexes_for_areas_seifa_2021_data__free.seifa.seifa_sa2
+    WHERE seifa_sa2 = '{sa2_code}'
+    AND unit_of_measure IN ('Score', 'Persons')
+""")
+
+# Population — same across all indexes so just take first
+population_row = seifa_df[seifa_df["UNIT_OF_MEASURE"] == "Persons"]
+sa2_population = float(population_row["OBS_VALUE"].iloc[0])
+
+# Scores
+scores = seifa_df[seifa_df["UNIT_OF_MEASURE"] == "Score"]
+seifa = dict(zip(scores["INDEX_TYPE"], scores["OBS_VALUE"]))
+
+irsad_score = float(seifa.get("Index of Relative Socio-economic Advantage and Disadvantage", 0))
+ier_score   = float(seifa.get("Index of Economic Resources", 0))
+ieo_score   = float(seifa.get("Index of Education and Occupation", 0))
+irsd_score  = float(seifa.get("Index of Relative Socio-economic Disadvantage", 0))
 
 # Get Number of Businesses
 
@@ -79,7 +85,7 @@ radius_calculation=math.sqrt(area)*100
 radius_calculation=max(100, min(radius_calculation, 5000))
 step_metres_calculation=radius_calculation*1.73
 
-population_density = float(value) / area  # people per km²
+population_density = float(sa2_population) / area  # people per km²
 
 if population_density < 1:
     max_points = 20
@@ -98,10 +104,40 @@ leads = scan_businesses_in_sa2(
 
 print("Number of leads:", len(leads))
 
+# Competition Quality Score
+if len(leads) > 0:
+    # Weighted average rating — weights higher-reviewed businesses more heavily
+    total_reviews = sum(lead[6] for lead in leads if lead[6])
+    
+    if total_reviews > 0:
+        weighted_rating = sum(
+            lead[5] * lead[6] 
+            for lead in leads 
+            if lead[5] and lead[6]
+        ) / total_reviews
+    else:
+        weighted_rating = 0
+
+    avg_reviews = total_reviews / len(leads)
+
+    # Competition strength — combines how good AND how established competitors are
+    # Scale 0-1: higher = stronger competition, harder to enter
+    competition_strength = (weighted_rating / 5) * min(avg_reviews / 500, 1)
+
+    print(f"Weighted avg competitor rating: {weighted_rating:.2f}")
+    print(f"Avg competitor reviews: {avg_reviews:.0f}")
+    print(f"Competition strength (0-1): {competition_strength:.3f}")
+
+else:
+    weighted_rating = 0
+    avg_reviews = 0
+    competition_strength = 0
+    print("No competitors found — maximum opportunity gap")
+
 # Does S/D Now Calculation
 
-if value is not None:
-    SDNow = len(leads) / float(value)
+if sa2_population is not None:
+    SDNow = len(leads) / float(sa2_population)
     print("Supply/Demand Now: ", SDNow)
 else:
     print("No value returned from population numbers, check sa2")
@@ -314,7 +350,7 @@ permits_df = run_query(f"""
     SELECT building_type, obs_value, time_period
     FROM construction_activity__australia__free.CONSTRUCTION_AUS_FREE.ABS_BUILDING_APPROVALS_ALL_LEVELS
     WHERE region_type = 'SA2: Statistical Area Level 2'
-      AND region = '{sa2}: {sa2_name}'
+      AND region = '{sa2_code}: {sa2_name}'
       AND measure = '2: Value of building jobs'
       AND building_type IN ({type_list})
       AND work_type = 'TOT: Total Work'
@@ -324,7 +360,7 @@ permits_df = run_query(f"""
 
 for label, btype in building_types.items():
     series = permits_df[permits_df["BUILDING_TYPE"] == btype]["OBS_VALUE"]
-    growth, acceleration = rolling_growth_score(series, value)
+    growth, acceleration = rolling_growth_score(series, sa2_population)
     print(f"{label} growth: {growth}")
     print(f"{label} acceleration: {acceleration}")
 
@@ -337,7 +373,7 @@ postcodes_df = run_query(f"""
             TO_GEOMETRY(p.geometry),
             TO_GEOMETRY(s.geometry)
         )
-    WHERE s.sa2_code_2021 = '{sa2}'
+    WHERE s.sa2_code_2021 = '{sa2_code}'
 """)
 
 matched = []
@@ -460,7 +496,7 @@ postcode_crime_data["POSTCODE"] = postcode_crime_data["POSTCODE"].astype(str)
 weights_df["postcode"] = weights_df["postcode"].astype(str)
 
 crime_merged = postcode_crime_data.merge(weights_df, left_on="POSTCODE", right_on="postcode")
-total_crime = (crime_merged["TOTAL_CRIME_COST"] * crime_merged["weight"]).sum() / value
+total_crime = (crime_merged["TOTAL_CRIME_COST"] * crime_merged["weight"]).sum() / sa2_population
 print("Last known economic cost:", total_crime)
 
 conn.close()
